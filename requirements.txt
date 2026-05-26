@@ -1,0 +1,29 @@
+# --- Crawling / parsing ALCF documentation pages ---
+# requests   : plain HTTP client we use to GET the doc pages.
+# beautifulsoup4 : HTML -> text. We strip nav, code-block boilerplate, etc.
+# lxml       : the parser BeautifulSoup uses under the hood (faster than html.parser).
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# --- Embeddings (local, runs on CPU, NO rate limits, NO API key) ---
+# sentence-transformers wraps Hugging Face Transformers with a friendly
+# `encode()` API. The default model we use, `all-MiniLM-L6-v2`, is ~80 MB,
+# produces 384-dim vectors, and embeds ~1000 sentences/sec on a laptop CPU.
+sentence-transformers==3.2.1
+# torch is pulled in transitively but we pin a CPU build to keep the install
+# small and avoid the multi-GB CUDA wheels.
+torch==2.4.1
+
+# --- Vector database ---
+# pymilvus ships Milvus Lite for Mac/Linux: an embedded, file-backed
+# Milvus that needs zero Docker / zero server. Perfect for a tutorial.
+pymilvus==2.4.9
+# pymilvus 2.4.x still imports pkg_resources, which setuptools 81+ removed.
+setuptools<81
+# environs 9.x (a pymilvus dep) needs marshmallow 3.x.
+marshmallow<4
+
+# --- Misc ---
+# tqdm gives a progress bar while embedding hundreds of chunks.
+tqdm==4.66.5
