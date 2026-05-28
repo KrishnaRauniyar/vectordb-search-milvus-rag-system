@@ -1,13 +1,19 @@
-# Milvus + sentence-transformers RAG demo on ALCF HPC documentation
+# Milvus + sentence-transformers + Qwen RAG on ALCF HPC documentation
 
 This project takes raw HPC documentation from
 [docs.alcf.anl.gov](https://docs.alcf.anl.gov/), turns it into a searchable
 semantic index, and lets you ask plain-English questions like
-*"how do I submit a multi-node GPU job on Polaris?"* and get back the
-exact paragraphs that answer the question — even if the page never uses
-the same words.
+*"how do I submit a multi-node GPU job on Polaris?"* — then a local
+instruction-tuned LLM (Qwen2.5-1.5B-Instruct) reads the retrieved
+passages and writes a grounded answer with citations.
 
-It's a five-stage pipeline:
+That last part is **Retrieval-Augmented Generation (RAG)**. Steps 1-5
+build and query the vector index; step 6 hands the top-K chunks to the
+LLM as context so it can answer in natural language without
+hallucinating. No API keys, no rate limits, no internet after the first
+model download — everything runs locally.
+
+It's a six-stage pipeline:
 
 ```
  docs.alcf.anl.gov  ─►  step1_download  ─►  raw HTML/JSON
@@ -20,10 +26,16 @@ It's a five-stage pipeline:
                                               │              all-MiniLM-L6-v2,
                                               │              384-dim, local CPU, no API)
                                               ▼
-                                         step4_index        (Milvus Lite, HNSW, COSINE)
+                                         step4_index        (Milvus Lite, IVF_FLAT, COSINE)
                                               │
                                               ▼
                                          step5_search       ◄── your query
+                                              │
+                                              ▼
+                                         step6_rag          (Qwen2.5-1.5B-Instruct,
+                                              │              local LLM, CPU/MPS/CUDA)
+                                              ▼
+                                         grounded answer + sources
 ```
 
 Each stage is its own file under [src/](src/), each file's docstring
@@ -39,8 +51,10 @@ them together.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Run the whole pipeline + a sample search
-#    (no API key, no .env, no internet required after the first model download)
+# 2. Run the whole pipeline + a sample question
+#    First run downloads ~80 MB of MiniLM weights and ~3 GB of Qwen2.5-1.5B
+#    weights into ~/.cache/huggingface. Subsequent runs reuse the cache.
+#    No API key, no .env, no internet required after that.
 python main.py
 
 # 3. Ask your own question
@@ -65,21 +79,26 @@ python -m src.step2_chunk
 python -m src.step3_embed
 python -m src.step4_index
 python -m src.step5_search "how do I use Globus to move data?"
+python -m src.step6_rag    "how do I use Globus to move data?"
 ```
 
 ### Re-running just the query (fastest path)
 
-Stages 1-3 are **idempotent and cached** — once `data/raw/` and
-`data/chunks.json` exist, the only thing that has to run for a new
-question is the embed-query + ANN search. To fire many queries against
-the already-built index without rebuilding anything:
+Stages 1-4 are **idempotent and cached** — once `data/raw/`,
+`data/chunks.json`, and `data/milvus_alcf.db` exist, the only thing
+that has to run for a new question is the embed-query + ANN search
+(+ LLM generation in RAG mode). To fire many queries against the
+already-built index without rebuilding anything:
 
 ```bash
+# Retrieval only — fast (~1 s including model load + search).
 .venv/bin/python -m src.step5_search "your next question"
+
+# Retrieval + RAG answer — slower (~5-30 s, depending on device).
+.venv/bin/python -m src.step6_rag    "your next question"
 ```
 
-That skips stages 1-4 entirely and usually takes ~1 second (model load
-+ search). After the first query the model stays cached on disk, so
+After the first invocation both model weights stay cached on disk, so
 launching a fresh Python interpreter for each query is fine.
 
 ### Reading the timing output
@@ -91,13 +110,13 @@ summary so you can see where the wall-clock budget actually went:
 ================================================================
   TIMING SUMMARY
 ================================================================
-    0.557s   11.4%  █████                                Step 1: download ALCF documentation pages
-    0.011s    0.2%                                       Step 2: split pages into chunks
-    2.902s   59.3%  █████████████████████████████        Step 3: embed chunks locally
-    1.105s   22.6%  ███████████                          Step 4: index chunks in Milvus
-    0.321s    6.5%  ███                                  Step 5: similarity search
+    0.664s    3.4%  █                                    Step 1: download ALCF documentation pages
+    0.011s    0.1%                                       Step 2: split pages into chunks
+    1.755s    9.1%  ████                                 Step 3: embed chunks locally
+    1.088s    5.6%  ██                                   Step 4: index chunks in Milvus
+   15.836s   81.8%  ████████████████████████████████████ Step 6: RAG: retrieve top-K (step 5) + answer with local LLM
 ----------------------------------------------------------------
-    4.896s  100.0%  ██████████████████████████████████   TOTAL
+   19.354s  100.0%  ███████████████████████████████████  TOTAL
 ```
 
 What you're looking at:
@@ -108,12 +127,15 @@ What you're looking at:
 | 2     | Recursive text splitter                      | <0.05 s, scales linearly with text size   |
 | 3     | SBERT model load + encode all chunks         | ~2-3 s (mostly model load); `[cached]` if vectors already exist |
 | 4     | Milvus drop + create + insert + K-means + load | ~1 s — always re-runs because we drop+recreate |
-| 5     | Embed query + IVF_FLAT ANN search            | ~0.3 s — step 5's own line breaks it down: `embedded in ~300 ms | searched ~6 ms` |
+| 5     | Embed query + IVF_FLAT ANN search (folded into step 6) | ~0.3 s — `embedded in ~300 ms | searched ~6 ms` |
+| 6     | LLM weight load + token generation           | ~3 s load (warm cache) + 5-30 s/answer (MPS); 30-60 s/answer (CPU); 1-3 s/answer (CUDA) |
 
-The big lesson visible in the bars: **embedding dominates everything
-else.** Search itself is a rounding error. This is why production RAG
-systems put so much effort into caching query embeddings and using
-fast-but-good-enough models — Milvus latency is rarely the bottleneck.
+The big lesson visible in the bars: **generation dominates retrieval.**
+The LLM forward passes take 10x-100x longer than the ANN search. This
+is why production RAG systems care about (a) caching query embeddings,
+(b) using fast-but-good-enough embedders, and (c) using *smaller*
+LLMs whenever the retrieved context is strong enough to compensate for
+less parametric knowledge. Milvus latency is rarely the bottleneck.
 
 ---
 
@@ -212,19 +234,71 @@ contract on Milvus Lite as on full server Milvus.
 
 ### Step 5 — search — [src/step5_search.py](src/step5_search.py)
 
-**What:** Embeds the user query (with `RETRIEVAL_QUERY` task type),
-calls `client.search(...)` with `metric_type=COSINE` and `ef=64`, prints
-the top-K hits with score, title, URL, and a text preview.
+**What:** Embeds the user query with the *same* MiniLM model used at
+ingest, calls `client.search(...)` with `metric_type=COSINE` and
+`nprobe=8`, prints the top-K hits with score, title, URL, and a text
+preview. Returns the hits so step 6 can use them.
 
 **Why measure timings:** The script prints embed time vs. search time
-separately. Even with a local model, the encode step (~2-10 ms) still
-dominates the ANN search (~0.2-0.5 ms) by an order of magnitude. With a
-hosted API on the embed side it's 100×+. Either way, the lesson is the
-same: tune your embedding pipeline before you bother optimizing Milvus.
+separately. Even with a local model, the encode step (~80 ms) still
+dominates the ANN search (~5 ms) by more than an order of magnitude.
+With a hosted API on the embed side it's 100×+. Either way, the lesson
+is the same: tune your embedding pipeline before you bother optimizing
+Milvus.
 
 **Key code:**
-- [`search`](src/step5_search.py#L75-L121) — the full query path.
-- [`_print_hit`](src/step5_search.py#L57-L72) — formatting only.
+- [`search`](src/step5_search.py#L88-L135) — the full query path.
+- [`_print_hit`](src/step5_search.py#L67-L82) — formatting only.
+
+---
+
+### Step 6 — RAG — [src/step6_rag.py](src/step6_rag.py)
+
+**What:** Takes the top-K hits from step 5, builds a chat-formatted
+prompt (system rules + numbered context + question), feeds it to a
+local instruction-tuned LLM (`Qwen/Qwen2.5-1.5B-Instruct`), and prints
+a grounded natural-language answer plus a list of source URLs.
+
+**Why this exists at all:** Steps 1-5 give you *retrieved passages*,
+not an *answer*. Most users don't want to read 5 chunks; they want one
+paragraph. An LLM is the right tool for "read these passages and write
+the answer." But asking an LLM to answer from its parametric memory
+gets you confident hallucinations on anything outside its training
+cutoff or training distribution. RAG fixes both: hand the LLM the
+relevant text first, then ask the question.
+
+**Why Qwen2.5-1.5B-Instruct:**
+- 1.5 B parameters, ~3 GB on disk in float32, ~1.5 GB in RAM at bf16.
+- Apache-2.0 — free for any use, no HF auth wall.
+- One of the most downloaded small instruct models on Hugging Face.
+- Strong at "answer from the provided context" tasks, which is exactly
+  what RAG needs — the model doesn't have to know HPC trivia; it just
+  has to read the passages we give it. Bigger isn't always better for
+  RAG: a 7B model would generate slightly cleaner prose but cost 4×
+  more memory and 3-5× more latency for marginal quality gains on this
+  workload. (To try a bigger one, change `LLM_MODEL` in
+  [src/config.py](src/config.py#L149).)
+
+**Why a chat template, not a hand-built prompt string:** Qwen was
+fine-tuned with specific role tokens (`<|im_start|>system`,
+`<|im_end|>`, etc.). The tokenizer's `apply_chat_template` writes them
+correctly; doing it by hand is the #1 source of garbled RAG outputs.
+
+**Why these generation knobs:**
+- `temperature=0.2` — low randomness; we want the model to stick to
+  what the retrieved chunks say, not creatively riff.
+- `max_new_tokens=350` — caps answer length so latency is bounded and
+  the model doesn't ramble or repeat itself.
+- `device` auto-picks CUDA > MPS > CPU; we use bfloat16 on
+  GPU/MPS (halves memory, no quality loss) and float32 on CPU (bf16 on
+  CPU is currently *slower* in PyTorch — scalar paths aren't optimised).
+
+**Key code:**
+- [`rag_answer`](src/step6_rag.py#L218-L255) — the full retrieve→prompt→generate→present pipeline.
+- [`_build_messages`](src/step6_rag.py#L168-L195) — the prompt template.
+- [`_generate`](src/step6_rag.py#L201-L215) — tokenize → `model.generate` → decode.
+- [`_load_llm`](src/step6_rag.py#L121-L150) — `lru_cache`'d weight loader.
+- [`_pick_device`](src/step6_rag.py#L103-L116) — CUDA > MPS > CPU autodetect.
 
 ---
 
@@ -339,6 +413,150 @@ The crucial point: **the SDK API is identical**. The code in
 ship against a 100-node Milvus cluster — you just change the URI from
 `./data/milvus_alcf.db` to something like
 `http://milvus.prod.internal:19530`.
+
+---
+
+## Retrieval-Augmented Generation — what it is and why it works
+
+### The problem RAG solves
+
+An LLM trained today has two failure modes when you ask it about
+something specific (your company's docs, a new HPC cluster, last
+week's news):
+
+1. **It doesn't know.** The fact wasn't in its training data, full
+   stop. Bigger models help, but no amount of scale closes the gap on
+   private or freshly updated information.
+2. **It pretends it does.** When asked an unknown question, an LLM's
+   "I don't know" probability is often lower than its "make up
+   something plausible" probability. This is the famous *hallucination*
+   problem.
+
+RAG attacks both with the same trick: **don't ask the model to
+remember — give it the answer in the prompt and ask it to read.**
+
+### The three-step RAG loop
+
+```
+   user question
+        │
+        ▼
+   ┌──────────────────┐
+   │ 1. RETRIEVE      │   embed query  →  Milvus top-K  →  list of chunks
+   └────────┬─────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │ 2. AUGMENT       │   build prompt: system rules + numbered chunks + question
+   └────────┬─────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │ 3. GENERATE      │   LLM reads the augmented prompt → writes answer
+   └──────────────────┘
+```
+
+In this project:
+- **Retrieve** is steps 1-5: chunks are pre-embedded, the query is
+  embedded at request time, Milvus returns the top-K chunks by cosine
+  similarity.
+- **Augment** is the prompt builder in
+  [src/step6_rag.py](src/step6_rag.py): the retrieved chunks become
+  numbered context blocks inside a chat-template message.
+- **Generate** is Qwen2.5-1.5B-Instruct producing tokens
+  autoregressively until it hits `max_new_tokens` or an end-of-turn
+  token.
+
+### What the prompt actually looks like
+
+```
+<|im_start|>system
+You are a helpful assistant for the Argonne Leadership Computing Facility
+(ALCF) user documentation. Answer the user's question using ONLY the
+numbered context passages provided. If the answer is not in the context,
+say you don't know rather than guessing. Be concise and, when helpful,
+cite the passage number like [2].
+<|im_end|>
+<|im_start|>user
+Context:
+[1] <text of top-1 chunk>
+
+[2] <text of top-2 chunk>
+
+[3] <text of top-3 chunk>
+
+[4] <text of top-4 chunk>
+
+[5] <text of top-5 chunk>
+
+Question: how do I submit a multi-node GPU job on Polaris?
+Answer:
+<|im_end|>
+<|im_start|>assistant
+```
+
+Every piece is load-bearing:
+- **System message** sets the contract ("answer from context only,
+  say so if unknown"). Drops hallucination rates a lot.
+- **Numbered chunks** let the model cite "[2]" instead of quoting
+  whole paragraphs back at you.
+- **`Answer:`** at the end nudges the model to start answering
+  immediately rather than restating the question.
+- **`apply_chat_template`** wraps the role markers (`<|im_start|>`,
+  `<|im_end|>`) — these are *exactly* the tokens Qwen was fine-tuned
+  on. Writing them by hand and getting them slightly wrong is the #1
+  reason RAG answers come out garbled.
+
+### Why generation looks like that (a 30-second LLM primer)
+
+Causal language models like Qwen are autoregressive: given a sequence
+of tokens, they predict the probability distribution over the *next*
+token. Generation is a loop:
+
+```
+prompt_tokens = tokenize(prompt)
+while not done and len(generated) < max_new_tokens:
+    logits   = model.forward(prompt_tokens + generated)   # [vocab_size]
+    probs    = softmax(logits[-1] / temperature)
+    next_tok = sample(probs, top_p=0.9)                    # or argmax if temp=0
+    generated.append(next_tok)
+    if next_tok == eos_token: break
+return decode(generated)
+```
+
+Each forward pass is one full transformer evaluation — for a 1.5 B
+model that's ~3 GFLOPs per token at fp32, or ~1.5 GFLOPs at bf16. On
+Apple Silicon MPS that's ~10-15 tokens/second; on a modern CUDA GPU
+~80-150 tokens/second; on a laptop CPU ~3-6 tokens/second. Our 350-token
+cap therefore costs us ~20-30 seconds on MPS, ~3-5 seconds on CUDA,
+~60-120 seconds on CPU.
+
+**Why temperature 0.2:** at `temperature=0` generation is greedy
+(argmax), which is *too* deterministic and tends to get stuck in
+repetition loops on small models. At `temperature=1.0` it's at the
+training distribution — fine for creative writing, bad for "answer
+from this exact text." A small temperature (0.1-0.3) is the standard
+RAG sweet spot.
+
+### Where RAG can still go wrong
+
+A surprising amount of "the LLM gave me a bad answer" turns out to be
+*retrieval* failing, not the LLM. Useful debugging order when an
+answer looks wrong:
+
+1. **Look at the retrieved chunks** (step 5 prints them). Is the right
+   passage in the top-K at all? If not, the embedder or the chunker is
+   the problem — not the LLM.
+2. **Look at the scores.** If the best score is below ~0.45 the
+   retrieved chunks are weak matches; the LLM was asked to answer from
+   irrelevant text and is filling in the gaps.
+3. **Look at the prompt itself.** Did the chunks get truncated? Are
+   the chat role tokens correct?
+4. *Then* look at the LLM. Try `temperature=0`, try a bigger model,
+   try a different system prompt.
+
+The order matters: garbage in, garbage out. A 70B model can't rescue
+the answer if the retrieval handed it the wrong page.
 
 ---
 
@@ -531,19 +749,47 @@ shrink the per-vector cost — and why a 384-d model like MiniLM is
 already 8× cheaper to store than a 3072-d hosted model before you do
 any quantization at all.
 
+### LLM generation (the slowest step in the whole pipeline)
+
+| Operation                                  | Typical cost (Qwen2.5-1.5B-Instruct)        |
+| ------------------------------------------ | ------------------------------------------- |
+| First-time weight download                 | ~3 GB into `~/.cache/huggingface`           |
+| Cold model load (weights cached on disk)   | ~2 – 5 s on MPS/CUDA, ~5 – 10 s on CPU      |
+| Token throughput, CUDA                     | ~80 – 150 tok/s                             |
+| Token throughput, Apple Silicon MPS        | ~10 – 15 tok/s                              |
+| Token throughput, laptop CPU               | ~3 – 6 tok/s                                |
+| Full answer (≤ 350 new tokens), CUDA       | ~1 – 3 s                                    |
+| Full answer (≤ 350 new tokens), MPS        | ~5 – 30 s                                   |
+| Full answer (≤ 350 new tokens), CPU        | ~30 – 120 s                                 |
+| Peak RAM at bf16 on GPU/MPS                | ~1.5 – 2 GB                                 |
+| Peak RAM at fp32 on CPU                    | ~6 GB                                       |
+
+Two consequences worth internalizing:
+
+1. **Generation is the new bottleneck.** Once you switch from
+   retrieval-only to RAG, the LLM forward passes dominate everything
+   else by 10×-100×. Optimizing Milvus past "good enough" is wasted
+   effort until you've done something about generation latency.
+2. **Smaller LLMs win for RAG.** A 1.5B model with strong retrieval
+   often beats a 7B model with the same retrieval, because the answer
+   is mostly *in the prompt* — the LLM is paraphrasing, not recalling.
+   Spend your latency budget on better embeddings and bigger top-K
+   before reaching for a bigger LLM.
+
 ---
 
 ## Files in this repo
 
 | Path                                              | What it does                                    |
 | ------------------------------------------------- | ----------------------------------------------- |
-| [main.py](main.py)                                | runs steps 1–5 end-to-end                       |
+| [main.py](main.py)                                | runs steps 1–6 end-to-end                       |
 | [src/config.py](src/config.py)                    | every tunable constant, with rationale          |
 | [src/step1_download.py](src/step1_download.py)   | crawl docs.alcf.anl.gov                         |
 | [src/step2_chunk.py](src/step2_chunk.py)         | recursive character splitter                    |
 | [src/step3_embed.py](src/step3_embed.py)         | local sentence-transformers embeddings          |
-| [src/step4_index.py](src/step4_index.py)         | Milvus collection + HNSW index                  |
+| [src/step4_index.py](src/step4_index.py)         | Milvus collection + IVF_FLAT index              |
 | [src/step5_search.py](src/step5_search.py)       | query embedding + ANN search                    |
+| [src/step6_rag.py](src/step6_rag.py)             | local LLM (Qwen2.5-1.5B-Instruct) RAG answer    |
 | [requirements.txt](requirements.txt)              | dependencies                                    |
 
 ---
@@ -551,9 +797,13 @@ any quantization at all.
 ## Further reading
 
 - Milvus architecture overview — <https://milvus.io/docs/architecture_overview.md>
+- Milvus's own "build a RAG" tutorial (the design this project follows) — <https://milvus.io/docs/build-rag-with-milvus.md>
 - HNSW paper (Malkov & Yashunin, 2016) — <https://arxiv.org/abs/1603.09320>
 - Matryoshka Representation Learning — <https://arxiv.org/abs/2205.13147>
 - sentence-transformers docs — <https://sbert.net/>
 - `all-MiniLM-L6-v2` model card — <https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2>
+- `Qwen/Qwen2.5-1.5B-Instruct` model card — <https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct>
+- Qwen2.5 technical report — <https://arxiv.org/abs/2412.15115>
+- Original RAG paper (Lewis et al., 2020) — <https://arxiv.org/abs/2005.11401>
 - MTEB embedding benchmark leaderboard — <https://huggingface.co/spaces/mteb/leaderboard>
 - ALCF user guides (our corpus) — <https://docs.alcf.anl.gov/>

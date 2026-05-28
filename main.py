@@ -1,12 +1,14 @@
 """
 End-to-end orchestrator.
 
-Runs steps 1 -> 5 in order:
+Runs steps 1 -> 6 in order:
     1. download  ALCF doc pages   ->  data/raw/*.json
     2. chunk     into ~800-char windows  ->  data/chunks.json
     3. embed     each chunk with SBERT (MiniLM)  ->  data/chunks.json (with vectors)
     4. index     into Milvus Lite        ->  data/milvus_alcf.db
     5. search    a sample query          ->  prints top-K hits
+    6. RAG       retrieve + ask local LLM (Qwen2.5-1.5B-Instruct) ->
+                 prints a grounded answer with sources
 
 Each step is idempotent on its own (cached download files, cached
 embeddings, dropped+recreated Milvus collection), so re-running this
@@ -27,7 +29,7 @@ from src.step1_download import download_all
 from src.step2_chunk import chunk_all
 from src.step3_embed import embed_all
 from src.step4_index import index_all
-from src.step5_search import search
+from src.step6_rag import rag_answer
 
 
 # Per-step elapsed times collected here, summarized at the end.
@@ -62,8 +64,11 @@ def main(query: str) -> None:
     with _step(4, "index chunks in Milvus"):
         index_all()
 
-    with _step(5, "similarity search"):
-        search(query)
+    # Step 5 (similarity search) is exercised *inside* step 6's rag_answer().
+    # We fold them into a single banner so the timing summary lines up with
+    # what the user actually waits for: "retrieve + answer".
+    with _step(6, "RAG: retrieve top-K (step 5) + answer with local LLM"):
+        rag_answer(query)
 
     # Final summary table so you can see at a glance where the wall-clock
     # budget actually went.

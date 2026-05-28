@@ -15,6 +15,19 @@ sentence-transformers==3.2.1
 # small and avoid the multi-GB CUDA wheels.
 torch==2.4.1
 
+# --- RAG: local LLM for answer generation ---
+# transformers       : Hugging Face's model loader/tokenizer/generator.
+#                      We use it to run Qwen/Qwen2.5-1.5B-Instruct on CPU,
+#                      Apple Silicon MPS, or CUDA. First run downloads ~3 GB
+#                      of weights into ~/.cache/huggingface; later runs are
+#                      instant.
+# accelerate         : transformers uses it to place model weights on the
+#                      chosen device (cuda/mps/cpu) via `device_map=...`.
+#                      Required even for single-device inference on recent
+#                      transformers versions.
+transformers>=4.45,<5
+accelerate>=1.0,<2
+
 # --- Vector database ---
 # pymilvus ships Milvus Lite for Mac/Linux: an embedded, file-backed
 # Milvus that needs zero Docker / zero server. Perfect for a tutorial.

@@ -8,6 +8,9 @@ back to this file in six months you should be able to retune it without
 re-reading the whole codebase.
 """
 
+# Needed for the `str | None` style annotations on Python 3.9.
+from __future__ import annotations
+
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -130,3 +133,37 @@ SEARCH_PARAMS = {"nprobe": 8}
 # How many neighbors to return. 5 is a reasonable default for a chat-style
 # RAG demo — enough variety, not so many that the user drowns in noise.
 TOP_K = 5
+
+# ---------------------------------------------------------------------------
+# Step 6: RAG generation
+# ---------------------------------------------------------------------------
+# Model choice: Qwen/Qwen2.5-1.5B-Instruct
+#   - 1.5B parameters, ~3 GB on disk
+#   - Apache 2.0 license, free for any use
+#   - Currently one of the most-downloaded small instruct LLMs on Hugging
+#     Face. Strong at "answer from context" tasks, which is exactly what
+#     RAG needs (it doesn't have to know facts — we hand it the facts).
+#   - Runs on CPU in ~30-60s per answer, on Apple Silicon MPS in ~5-15s,
+#     on a CUDA GPU in ~1-3s. We auto-detect the best device below.
+#
+# To try a different model, change LLM_MODEL to any other instruct model
+# on HF (e.g. "Qwen/Qwen2.5-0.5B-Instruct" for faster but lower quality,
+# or "microsoft/Phi-3-mini-4k-instruct" for stronger but slower).
+LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+
+# Max tokens the model is allowed to generate per answer. 350 ~ 250-300
+# English words, plenty for a focused HPC-docs Q&A. Cap exists because:
+#   - longer answers = linearly slower generation,
+#   - the model would otherwise sometimes ramble or repeat itself.
+LLM_MAX_NEW_TOKENS = 350
+
+# Sampling temperature.
+#   0.0 - 0.3  → deterministic, factual; good for RAG.
+#   0.7 - 1.0  → creative; bad for "answer from context" use cases.
+# We pick 0.2 because we want the model to stick close to what the
+# retrieved chunks say, not invent.
+LLM_TEMPERATURE = 0.2
+
+# Device selection. None ⇒ auto-detect (CUDA > MPS > CPU). Override to
+# force a specific device — e.g. "cpu" for reproducibility tests.
+LLM_DEVICE: str | None = None
